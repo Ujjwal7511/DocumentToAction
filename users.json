@@ -1,0 +1,10 @@
+{
+  "sujjwal": {
+    "password": "5994471abb01112afcc18159f6cc74b4f511b99806da59b3caf5a9c173cacfc5",
+    "created_at": "manual"
+  },
+  "testuser": {
+    "password": "13d249f2cb4127b40cfa757866850278793f814ded3c587fe5889e889a7a9f6c",
+    "created_at": "manual"
+  }
+}

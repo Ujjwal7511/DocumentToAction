@@ -1,0 +1,5 @@
+{
+  "title": "Dependency Upgrades Need Compatibility Verification",
+  "standard_id": "ENG-STD-006",
+  "content": "# Dependency Upgrades Need Compatibility Verification\n\n**Standard ID:** ENG-STD-006\n\n## Rule\n\nMajor or minor upgrades of shared libraries, frameworks, or runtime versions must include:\n\n1. A compatibility checklist against dependent services\n2. Automated test results on the upgraded version\n3. A staged rollout plan (canary or percentage deploy) for production\n4. A documented revert path to the previous lockfile / image tag\n\n## Rationale\n\nDependency bumps without verification have repeatedly caused cascading build and runtime failures across teams.\n"
+}
