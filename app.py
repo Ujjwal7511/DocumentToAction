@@ -399,10 +399,10 @@ def render_hero() -> None:
         else "LLM key missing · heuristic mode active"
     )
     if st.session_state.get("authenticated", False):
-        st.markdown("<div class='dta-header-controls'></div>", unsafe_allow_html=True)
-        logout_col, _ = st.columns([1, 4])
-        with logout_col:
-            if st.button("Logout", key="global_logout"):
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            if st.button("History", icon=":material/history:", key="history_toggle"):
+                st.session_state.show_history = not st.session_state.get("show_history", False)
+            if st.button("Logout", icon=":material/logout:", key="global_logout"):
                 _logout_user()
     st.markdown(
         f"""
@@ -481,9 +481,6 @@ def render_upload_panel() -> None:
 
 def render_history_panel() -> None:
     """Expose MongoDB-backed project sessions and let the user reopen one."""
-    if st.button("History", key="history_toggle"):
-        st.session_state.show_history = not st.session_state.get("show_history", False)
-
     if not st.session_state.get("show_history", False):
         return
 
