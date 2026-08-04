@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import json
 import os
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
 from pymongo import MongoClient, ReturnDocument
+import streamlit as st
 
 load_dotenv()
 
@@ -45,6 +47,30 @@ ROOT = Path(__file__).resolve().parent
 USER_STORE = ROOT / "users.json"
 
 _client: Optional[MongoClient] = None
+_read_cache_clearers: list[Any] = []
+
+
+def _cached_read(func):
+    """Cache short-lived read queries and register them for write invalidation."""
+    cached = st.cache_data(ttl=20, show_spinner=False)(func)
+    _read_cache_clearers.append(cached.clear)
+    return cached
+
+
+def _clear_read_cache() -> None:
+    for clear in _read_cache_clearers:
+        clear()
+
+
+def _invalidate_after_write(func):
+    """Keep cached views correct immediately after any MongoDB mutation."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        result = func(*args, **kwargs)
+        _clear_read_cache()
+        return result
+
+    return wrapped
 
 
 def _get_client() -> MongoClient:
@@ -83,6 +109,7 @@ def _out_session(doc: dict) -> dict:
         "id": doc["_id"],
         "title": doc.get("title", "Untitled Project"),
         "created_at": doc.get("created_at"),
+        "updated_at": doc.get("updated_at", doc.get("created_at")),
     }
 
 
@@ -205,6 +232,7 @@ def init_db(db_path: Optional[str] = None) -> None:
     dbase["action_items"].create_index([("session_id", 1), ("status", 1)])
     dbase["kb_matches"].create_index("session_id")
     dbase["reviewed_summaries"].create_index("session_id")
+    dbase["project_sessions"].create_index("updated_at")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +281,7 @@ def get_user_account(username: str) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+@_invalidate_after_write
 def create_session(title: str = "Untitled Project") -> dict:
     """Create a new project analysis session."""
     now = _utcnow()
@@ -266,11 +295,32 @@ def create_session(title: str = "Untitled Project") -> dict:
     return _out_session(doc)
 
 
+@_cached_read
 def get_project_session(session_id: int) -> Optional[dict]:
     doc = _get_db()["project_sessions"].find_one({"_id": session_id})
     return _out_session(doc) if doc else None
 
 
+@_cached_read
+def list_project_sessions(limit: int = 25) -> list[dict]:
+    """Return recent project sessions so saved work can be reopened from the UI."""
+    safe_limit = max(1, min(int(limit), 100))
+    rows = (
+        _get_db()["project_sessions"]
+        .find({})
+        .sort("updated_at", -1)
+        .limit(safe_limit)
+    )
+    return [_out_session(doc) for doc in rows]
+
+
+def _touch_session(session_id: int) -> None:
+    _get_db()["project_sessions"].update_one(
+        {"_id": session_id}, {"$set": {"updated_at": _utcnow()}}
+    )
+
+
+@_invalidate_after_write
 def add_document(
     session_id: int,
     filename: str,
@@ -292,9 +342,11 @@ def add_document(
         "updated_at": now,
     }
     _get_db()["documents"].insert_one(doc)
+    _touch_session(session_id)
     return _out_document(doc)
 
 
+@_invalidate_after_write
 def update_document_type(document_id: int, doc_type: str, confidence: float) -> None:
     _get_db()["documents"].update_one(
         {"_id": document_id},
@@ -302,6 +354,7 @@ def update_document_type(document_id: int, doc_type: str, confidence: float) -> 
     )
 
 
+@_cached_read
 def list_documents(session_id: int) -> list[dict]:
     rows = (
         _get_db()["documents"].find({"session_id": session_id}).sort("_id", 1)
@@ -309,6 +362,7 @@ def list_documents(session_id: int) -> list[dict]:
     return [_out_document(d) for d in rows]
 
 
+@_cached_read
 def get_document(document_id: int) -> Optional[dict]:
     doc = _get_db()["documents"].find_one({"_id": document_id})
     return _out_document(doc) if doc else None
@@ -319,6 +373,7 @@ def get_document(document_id: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+@_invalidate_after_write
 def add_extracted_item(
     document_id: int,
     item_type: str,
@@ -351,6 +406,7 @@ def add_extracted_item(
     return _out_item(doc)
 
 
+@_cached_read
 def list_extracted_items(
     document_id: Optional[int] = None,
     session_id: Optional[int] = None,
@@ -368,6 +424,7 @@ def list_extracted_items(
     return [_out_item(d) for d in rows]
 
 
+@_invalidate_after_write
 def update_extracted_item(
     item_id: int,
     content: Optional[str] = None,
@@ -390,6 +447,7 @@ def update_extracted_item(
     return result.matched_count == 1
 
 
+@_cached_read
 def get_extracted_item(item_id: int) -> Optional[dict]:
     doc = _get_db()["extracted_items"].find_one({"_id": item_id})
     return _out_item(doc) if doc else None
@@ -400,6 +458,7 @@ def get_extracted_item(item_id: int) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 
+@_invalidate_after_write
 def add_conflict(
     session_id: int,
     description: str,
@@ -423,11 +482,13 @@ def add_conflict(
     return _out_conflict(doc)
 
 
+@_cached_read
 def list_conflicts(session_id: int) -> list[dict]:
     rows = _get_db()["conflicts"].find({"session_id": session_id}).sort("_id", 1)
     return [_out_conflict(d) for d in rows]
 
 
+@_invalidate_after_write
 def resolve_conflict(
     conflict_id: int,
     status: str,
@@ -454,6 +515,7 @@ def resolve_conflict(
 # ---------------------------------------------------------------------------
 
 
+@_invalidate_after_write
 def add_action_item(
     session_id: int,
     description: str,
@@ -486,11 +548,13 @@ def add_action_item(
     return _out_action(doc)
 
 
+@_cached_read
 def list_action_items(session_id: int) -> list[dict]:
     rows = _get_db()["action_items"].find({"session_id": session_id}).sort("_id", 1)
     return [_out_action(d) for d in rows]
 
 
+@_invalidate_after_write
 def update_action_item(
     action_id: int,
     description: Optional[str] = None,
@@ -516,11 +580,13 @@ def update_action_item(
     return result.matched_count == 1
 
 
+@_cached_read
 def get_action_item(action_id: int) -> Optional[dict]:
     doc = _get_db()["action_items"].find_one({"_id": action_id})
     return _out_action(doc) if doc else None
 
 
+@_invalidate_after_write
 def approve_action_item(action_id: int) -> bool:
     """Explicitly approve a proposed action item (user-triggered only)."""
     result = _get_db()["action_items"].update_one(
@@ -537,6 +603,7 @@ def approve_action_item(action_id: int) -> bool:
     return result.matched_count == 1
 
 
+@_invalidate_after_write
 def reject_action_item(action_id: int) -> bool:
     """Explicitly reject a proposed action item (user-triggered only)."""
     result = _get_db()["action_items"].update_one(
@@ -553,6 +620,7 @@ def reject_action_item(action_id: int) -> bool:
     return result.matched_count == 1
 
 
+@_invalidate_after_write
 def reset_action_to_proposed(action_id: int) -> bool:
     """Force an action back to proposed (used by invariant guard / UI reset)."""
     result = _get_db()["action_items"].update_one(
@@ -574,6 +642,7 @@ def reset_action_to_proposed(action_id: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+@_invalidate_after_write
 def add_kb_match(
     session_id: int,
     kb_title: str,
@@ -601,6 +670,7 @@ def add_kb_match(
     return _out_kb(doc)
 
 
+@_cached_read
 def list_kb_matches(session_id: int) -> list[dict]:
     rows = (
         _get_db()["kb_matches"].find({"session_id": session_id}).sort("relevance_score", -1)
@@ -608,6 +678,7 @@ def list_kb_matches(session_id: int) -> list[dict]:
     return [_out_kb(d) for d in rows]
 
 
+@_invalidate_after_write
 def save_reviewed_summary(
     session_id: int,
     title: str,
@@ -624,9 +695,11 @@ def save_reviewed_summary(
         "updated_at": now,
     }
     _get_db()["reviewed_summaries"].insert_one(doc)
+    _touch_session(session_id)
     return _out_summary(doc)
 
 
+@_cached_read
 def list_summaries(session_id: int) -> list[dict]:
     rows = (
         _get_db()["reviewed_summaries"]
@@ -636,11 +709,13 @@ def list_summaries(session_id: int) -> list[dict]:
     return [_out_summary(d) for d in rows]
 
 
+@_cached_read
 def get_summary(summary_id: int) -> Optional[dict]:
     doc = _get_db()["reviewed_summaries"].find_one({"_id": summary_id})
     return _out_summary(doc) if doc else None
 
 
+@_cached_read
 def build_reviewed_summary_payload(session_id: int) -> dict[str, Any]:
     """Assemble summary content by querying MongoDB for the CURRENT state.
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 from typing import BinaryIO, Optional, Union
 
@@ -13,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {".txt", ".md", ".markdown", ".docx", ".pdf"}
 MAX_DOCUMENTS = 3
+ANALYSIS_MAX_WORKERS = max(1, min(int(os.getenv("ANALYSIS_MAX_WORKERS", "3")), MAX_DOCUMENTS))
 
 DOC_TYPES = [
     "meeting_notes",
@@ -270,6 +273,19 @@ def ingest_upload(
         "doc_type_rationale": type_info["rationale"],
         "is_empty": not bool(content.strip()) if content else True,
     }
+
+
+def ingest_uploads_parallel(uploads: list[tuple[str, bytes]]) -> list[dict]:
+    """Parse and classify independent uploads concurrently, preserving input order.
+
+    Gemini calls are network-bound, so parallelizing the small upload batch avoids
+    waiting for each document classification before the next one starts.
+    """
+    if not uploads:
+        return []
+    with ThreadPoolExecutor(max_workers=min(ANALYSIS_MAX_WORKERS, len(uploads))) as executor:
+        futures = [executor.submit(ingest_upload, filename, data) for filename, data in uploads]
+        return [future.result() for future in futures]
 
 
 def validate_upload_batch(filenames: list[str]) -> Optional[str]:

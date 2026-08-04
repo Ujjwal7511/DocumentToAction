@@ -8,7 +8,9 @@ which enforces approved=False — this module never sets approved=True.
 from __future__ import annotations
 
 import logging
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 import db
@@ -16,6 +18,8 @@ from ingest import split_into_sections
 from llm_client import LLMError, generate_json, is_configured
 
 logger = logging.getLogger(__name__)
+
+ANALYSIS_MAX_WORKERS = max(1, int(os.getenv("ANALYSIS_MAX_WORKERS", "3")))
 
 ITEM_TYPES = [
     "fact",
@@ -593,12 +597,22 @@ def run_full_extraction(session_id: int) -> dict[str, Any]:
     Returns counts for UI feedback. Does not approve any action items.
     """
     documents = db.list_documents(session_id)
+    nonempty_documents = [
+        doc for doc in documents if (doc.get("content") or "").strip()
+    ]
     total_items = 0
-    for doc in documents:
-        if not (doc.get("content") or "").strip():
-            continue
-        items = extract_from_document(doc.get("id"))
-        total_items += len(items)
+    if nonempty_documents:
+        # Each document has an independent Gemini request and writes to its own
+        # extracted-item records. PyMongo's client is thread-safe, and the ID
+        # counters use atomic find_one_and_update operations.
+        with ThreadPoolExecutor(
+            max_workers=min(ANALYSIS_MAX_WORKERS, len(nonempty_documents))
+        ) as executor:
+            futures = [
+                executor.submit(extract_from_document, doc["id"])
+                for doc in nonempty_documents
+            ]
+            total_items = sum(len(future.result()) for future in futures)
 
     gaps = suggest_missing_gaps(session_id)
     actions = db.list_action_items(session_id)

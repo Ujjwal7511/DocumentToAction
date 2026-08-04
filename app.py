@@ -191,8 +191,15 @@ def _inject_styles() -> None:
     )
 
 
-def _init_state() -> None:
+@st.cache_resource(show_spinner=False)
+def _initialize_database() -> str:
+    """Run the MongoDB ping/index setup once per Streamlit server process."""
     db.init_db()
+    return db.get_backend_name()
+
+
+def _init_state() -> None:
+    _initialize_database()
     defaults = {
         "session_id": None,
         "analysis_done": False,
@@ -273,14 +280,15 @@ def run_analysis(uploaded_files: list, title: str) -> None:
     progress = st.progress(0, text="Ingesting documents…")
     n = len(uploaded_files)
 
-    for i, uf in enumerate(uploaded_files):
-        data = uf.getvalue()
-        try:
-            parsed = ingest.ingest_upload(uf.name, data)
-        except ValueError as exc:
-            st.session_state.last_error = str(exc)
-            return
+    try:
+        parsed_uploads = ingest.ingest_uploads_parallel(
+            [(uf.name, uf.getvalue()) for uf in uploaded_files]
+        )
+    except ValueError as exc:
+        st.session_state.last_error = str(exc)
+        return
 
+    for i, parsed in enumerate(parsed_uploads):
         db.add_document(
             session_id=sess["id"],
             filename=parsed["filename"],
@@ -288,7 +296,7 @@ def run_analysis(uploaded_files: list, title: str) -> None:
             doc_type=parsed["doc_type"],
             doc_type_confidence=parsed["doc_type_confidence"],
         )
-        progress.progress((i + 1) / (n + 3), text=f"Ingested {uf.name}")
+        progress.progress((i + 1) / (n + 3), text=f"Ingested {parsed['filename']}")
 
     progress.progress(0.55, text="Extracting facts, decisions, risks, and proposed actions…")
     extract.run_full_extraction(sess["id"])
@@ -469,6 +477,36 @@ def render_upload_panel() -> None:
         st.error(st.session_state.last_error)
     if st.session_state.status_message and st.session_state.analysis_done:
         st.success(st.session_state.status_message)
+
+
+def render_history_panel() -> None:
+    """Expose MongoDB-backed project sessions and let the user reopen one."""
+    if st.button("History", key="history_toggle"):
+        st.session_state.show_history = not st.session_state.get("show_history", False)
+
+    if not st.session_state.get("show_history", False):
+        return
+
+    sessions = db.list_project_sessions()
+    with st.container(border=True):
+        st.markdown("#### Project history")
+        if not sessions:
+            st.info("No saved projects yet. Run an analysis to create one.")
+            return
+        for project in sessions:
+            created = project.get("created_at")
+            timestamp = created.strftime("%Y-%m-%d %H:%M") if created else "Unknown date"
+            col_a, col_b = st.columns([4, 1])
+            with col_a:
+                st.markdown(f"**{project.get('title')}**  \\n{timestamp}")
+            with col_b:
+                if st.button("Open", key=f"open_history_{project['id']}"):
+                    st.session_state.session_id = project["id"]
+                    st.session_state.project_title = project.get("title") or "Untitled Project"
+                    st.session_state.analysis_done = True
+                    st.session_state.prepared_uploads = None
+                    st.session_state.status_message = f"Opened saved project: {project.get('title')}"
+                    st.rerun()
 
 
 def _render_metric_card(label: str, value: Any) -> None:
@@ -1030,6 +1068,8 @@ def main() -> None:
     if not st.session_state.get("authenticated", False):
         return
     render_hero()
+
+    render_history_panel()
 
     if not llm_client.is_configured():
         st.warning(
